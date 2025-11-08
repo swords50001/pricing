@@ -71,12 +71,16 @@ jobs:
 
       # 6) (Optional) Update environment variables from GitHub secrets
       - name: Update Lambda environment variables
-        if: ${{ env.BING_SUBSCRIPTION_KEY != '' || secrets.BING_SUBSCRIPTION_KEY != '' }}
         run: |
-          # add any envs you need here
+          if [ -n "${{ secrets.BING_SUBSCRIPTION_KEY }}" ]; then
+          echo "Setting BING_SUBSCRIPTION_KEY on Lambda…"
           aws lambda update-function-configuration \
             --function-name "$LAMBDA_FUNCTION" \
             --environment "Variables={BING_SUBSCRIPTION_KEY=${{ secrets.BING_SUBSCRIPTION_KEY }},PYTHONUNBUFFERED=1}"
+          else
+          echo "No BING_SUBSCRIPTION_KEY secret set; skipping."
+          fi
+
 
       # 7) Output function ARN
       - name: Show Lambda details
