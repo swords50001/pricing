@@ -1,0 +1,84 @@
+name: Build & Deploy to Lambda (Container)
+on:
+  push:
+    branches: [ main ]
+
+env:
+  APP_NAME: price-finder
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+  ECR_REPO: price-finder
+  IMAGE_TAG: ${{ github.sha }}
+  LAMBDA_FUNCTION: price-finder
+  CONTAINER_PORT: "8080"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # OIDC
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1) Configure AWS via OIDC
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # 2) Ensure ECR repo exists
+      - name: Ensure ECR repository
+        id: ecr
+        run: |
+          aws ecr describe-repositories --repository-names "$ECR_REPO" >/dev/null 2>&1 || \
+          aws ecr create-repository --repository-name "$ECR_REPO" >/dev/null
+          echo "repo_uri=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}" >> $GITHUB_OUTPUT
+
+      # 3) Login to ECR
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      # 4) Build & push image
+      - name: Build and push image
+        run: |
+          IMAGE_URI="${{ steps.ecr.outputs.repo_uri }}:${IMAGE_TAG}"
+          docker build -t "$IMAGE_URI" .
+          docker push "$IMAGE_URI"
+          echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+      # 5) Create Lambda function if missing, else update code
+      - name: Create or update Lambda function
+        id: deploy
+        run: |
+          IMAGE_URI="${{ steps.ecr.outputs.repo_uri }}:${IMAGE_TAG}"
+          set -e
+
+          if aws lambda get-function --function-name "$LAMBDA_FUNCTION" >/dev/null 2>&1; then
+            echo "Updating existing Lambda code..."
+            aws lambda update-function-code \
+              --function-name "$LAMBDA_FUNCTION" \
+              --image-uri "$IMAGE_URI" >/dev/null
+          else
+            echo "Creating Lambda function..."
+            aws lambda create-function \
+              --function-name "$LAMBDA_FUNCTION" \
+              --package-type Image \
+              --code ImageUri="$IMAGE_URI" \
+              --role "${{ secrets.AWS_LAMBDA_ROLE_ARN }}" \
+              --timeout 60 \
+              --memory-size 2048 >/dev/null
+          fi
+
+      # 6) (Optional) Update environment variables from GitHub secrets
+      - name: Update Lambda environment variables
+        if: ${{ env.BING_SUBSCRIPTION_KEY != '' || secrets.BING_SUBSCRIPTION_KEY != '' }}
+        run: |
+          # add any envs you need here
+          aws lambda update-function-configuration \
+            --function-name "$LAMBDA_FUNCTION" \
+            --environment "Variables={BING_SUBSCRIPTION_KEY=${{ secrets.BING_SUBSCRIPTION_KEY }},PYTHONUNBUFFERED=1}"
+
+      # 7) Output function ARN
+      - name: Show Lambda details
+        run: |
+          aws lambda get-function --function-name "$LAMBDA_FUNCTION" --query 'Configuration.FunctionArn' --output text
