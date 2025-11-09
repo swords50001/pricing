@@ -134,6 +134,18 @@ jobs:
               --memory-size 2048 >/dev/null
           fi
 
+      - name: Force ImageConfig (EntryPoint/Command) for web adapter + uvicorn
+        run: |
+          aws lambda update-function-configuration \
+            --function-name "$LAMBDA_FUNCTION" \
+            --image-config '{
+              "EntryPoint": [],
+              "Command": ["uvicorn","pricing.portal:app","--host","0.0.0.0","--port","8080","--proxy-headers","--log-level","info"],
+              "WorkingDirectory": ""
+            }'
+          echo "Current ImageConfig:"
+          aws lambda get-function --function-name "$LAMBDA_FUNCTION" --query 'Configuration.ImageConfigResponse'
+          
       # 8) Update Lambda environment variables (shell-guarded; no 'secrets' in if:)
       - name: Update Lambda environment variables
         run: |
