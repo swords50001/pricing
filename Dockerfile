@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-# --- Stage 0: get the Lambda Web Adapter binary (no curl needed) ---
+# --- Stage 0: fetch the Lambda Web Adapter binary ---
 FROM public.ecr.aws/awsguru/aws-lambda-adapter:0.8.3 AS lambda-adapter
 
 # --- Stage 1: your Lambda runtime image ---
@@ -16,8 +16,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # App code
 COPY pricing ./pricing
 
-# Copy the adapter binary from stage 0
-COPY --from=lambda-adapter /aws-lambda-adapter /aws-lambda-adapter
+# Copy the adapter binary FROM the adapter image (note the source path!)
+COPY --from=lambda-adapter /lambda-adapter /aws-lambda-adapter
 RUN chmod +x /aws-lambda-adapter
 
 # Adapter configuration
