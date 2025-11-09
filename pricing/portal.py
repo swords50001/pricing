@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from .model import ClothingPriceModel, SearchResult
+from mangum import Mangum
 
 
 @dataclass
@@ -594,6 +595,7 @@ async def upload(
     )
     return HTMLResponse(content=html_text)
 
+handler = Mangum(app, lifespan="off")
 
 @app.post("/search", response_class=JSONResponse)
 async def search_api(payload: dict) -> JSONResponse:
