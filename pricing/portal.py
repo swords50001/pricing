@@ -9,8 +9,13 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import cgi
-from typing import Callable, Iterable, List, Optional, Tuple
+from typing import Callable, Iterable, List, Optional, Tuple, Any
 from urllib.parse import quote
+
+# ---- NEW: FastAPI imports ----
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from .model import ClothingPriceModel, SearchResult
 
@@ -32,6 +37,9 @@ def _default_model_factory(base_url: str, limit: int, timeout: float) -> Clothin
     return ClothingPriceModel(base_url=base_url, limit=limit, timeout=timeout)
 
 
+# =============================================================================
+# ORIGINAL http.server IMPLEMENTATION (kept for CLI/local use)
+# =============================================================================
 class _PricingPortalRequestHandler(BaseHTTPRequestHandler):
     """Request handler used by :func:`run` to serve the portal."""
 
@@ -131,7 +139,6 @@ class _PricingPortalRequestHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: object) -> None:  # noqa: A003
         """Silence the default stderr logging for cleaner console output."""
-
         return None
 
     def _render_page(
@@ -382,7 +389,7 @@ def _render_template(
   <h1>Clothing Price Lookup Portal</h1>
   <p>Upload a CSV containing <code>brand</code> and <code>title</code> columns to fetch live pricing data.</p>
   {message_html}
-  <form method=\"post\" enctype=\"multipart/form-data\">
+  <form method=\"post\" enctype=\"multipart/form-data\" action=\"/upload\">
     <label for=\"base_url\">Product search API URL</label>
     <input id=\"base_url\" name=\"base_url\" type=\"text\" value=\"{_escape(values['base_url'])}\" />
     <label for=\"limit\">Results per request</label>
@@ -469,6 +476,162 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     )
     run(host=args.host, port=args.port, config=config)
     return 0
+
+
+# =============================================================================
+# NEW: FastAPI ASGI app for Lambda/Web Adapter
+# =============================================================================
+app = FastAPI(title="Clothing Price Lookup Portal", version="1.0")
+
+# CORS: open now; restrict in production
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/health")
+def health() -> dict:
+    return {"ok": True}
+
+
+@app.get("/", response_class=HTMLResponse)
+def form() -> HTMLResponse:
+    # Render the bare form with defaults
+    cfg = PortalConfig()
+    html_text = _render_template(
+        config=cfg,
+        values={
+            "base_url": cfg.base_url,
+            "limit": str(cfg.limit),
+            "timeout": str(cfg.timeout),
+            "min_score": str(cfg.min_score),
+        },
+        error=None,
+        success=None,
+        table_rows=None,
+        csv_payload=None,
+        download_href=None,
+    )
+    return HTMLResponse(content=html_text)
+
+
+@app.post("/upload", response_class=HTMLResponse)
+async def upload(
+    base_url: str = Form(PortalConfig.base_url),
+    limit: int = Form(PortalConfig.limit),
+    timeout: float = Form(PortalConfig.timeout),
+    min_score: float = Form(PortalConfig.min_score),
+    queries: UploadFile = File(...),
+) -> HTMLResponse:
+    # Read uploaded CSV
+    data = await queries.read()
+    parsed = _parse_queries_bytes(data)
+    if isinstance(parsed, str):
+        # Render page with error message
+        cfg = PortalConfig(base_url=base_url, limit=limit, timeout=timeout, min_score=min_score)
+        html_text = _render_template(
+            config=cfg,
+            values={
+                "base_url": base_url,
+                "limit": str(limit),
+                "timeout": str(timeout),
+                "min_score": str(min_score),
+            },
+            error=parsed,
+            success=None,
+            table_rows=None,
+            csv_payload=None,
+            download_href=None,
+        )
+        return HTMLResponse(content=html_text)
+
+    queries_list = parsed
+    if not queries_list:
+        cfg = PortalConfig(base_url=base_url, limit=limit, timeout=timeout, min_score=min_score)
+        html_text = _render_template(
+            config=cfg,
+            values={
+                "base_url": base_url,
+                "limit": str(limit),
+                "timeout": str(timeout),
+                "min_score": str(min_score),
+            },
+            error="The uploaded CSV did not contain any brand/title rows.",
+            success=None,
+            table_rows=None,
+            csv_payload=None,
+            download_href=None,
+        )
+        return HTMLResponse(content=html_text)
+
+    # Run model batch search
+    model = _default_model_factory(base_url=base_url, limit=limit, timeout=timeout)
+    try:
+        results = model.batch_search(queries_list, min_score=min_score)
+    finally:
+        model.close()
+
+    table_rows, csv_payload = _build_results_output(queries_list, results)
+    download_href = f"data:text/csv;charset=utf-8,{quote(csv_payload)}"
+
+    cfg = PortalConfig(base_url=base_url, limit=limit, timeout=timeout, min_score=min_score)
+    html_text = _render_template(
+        config=cfg,
+        values={
+            "base_url": base_url,
+            "limit": str(limit),
+            "timeout": str(timeout),
+            "min_score": str(min_score),
+        },
+        error=None,
+        success="Price lookup complete. Download the results below.",
+        table_rows=table_rows,
+        csv_payload=csv_payload,
+        download_href=download_href,
+    )
+    return HTMLResponse(content=html_text)
+
+
+@app.post("/search", response_class=JSONResponse)
+async def search_api(payload: dict) -> JSONResponse:
+    """
+    JSON API:
+      body: { "brand": "Nike", "title": "Air Force 1 Low White" }
+      or:   { "pairs": [ ["Nike","Air Force 1"], ["Adidas","Campus 00s"] ] }
+    Returns a list of results with price (or null if not found).
+    """
+    base_url = payload.get("base_url", PortalConfig.base_url)
+    limit = int(payload.get("limit", PortalConfig.limit))
+    timeout = float(payload.get("timeout", PortalConfig.timeout))
+    min_score = float(payload.get("min_score", PortalConfig.min_score))
+
+    pairs: List[Tuple[str, str]]
+    if "pairs" in payload and isinstance(payload["pairs"], list):
+        pairs = [(str(b), str(t)) for b, t in payload["pairs"] if b and t]
+    else:
+        brand = str(payload.get("brand", "")).strip()
+        title = str(payload.get("title", "")).strip()
+        if not (brand and title):
+            raise HTTPException(status_code=400, detail="Provide 'brand' and 'title' or 'pairs'.")
+        pairs = [(brand, title)]
+
+    model = _default_model_factory(base_url=base_url, limit=limit, timeout=timeout)
+    try:
+        results = model.batch_search(pairs, min_score=min_score)
+    finally:
+        model.close()
+
+    out: List[dict[str, Any]] = []
+    for (b, t), r in zip(pairs, results):
+        if r is None:
+            out.append({"brand": b, "title": t, "price": None, "found": False})
+        else:
+            out.append({"brand": r.brand, "title": r.title, "price": r.price, "found": True})
+
+    return JSONResponse(content={"results": out})
 
 
 if __name__ == "__main__":  # pragma: no cover - manual execution entrypoint
