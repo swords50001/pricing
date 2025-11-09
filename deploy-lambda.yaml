@@ -11,6 +11,8 @@ env:
   IMAGE_TAG: ${{ github.sha }}
   LAMBDA_FUNCTION: price-finder
   CONTAINER_PORT: "8080"
+  # optional: promote secret to env if you prefer using if: env.BING_SECRET != ''
+  BING_SECRET: ${{ secrets.BING_SUBSCRIPTION_KEY }}
 
 jobs:
   deploy:
@@ -20,6 +22,14 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+
+      # 0) Assert required secrets exist early (fail fast)
+      - name: Assert required secrets
+        run: |
+          [ -n "${{ secrets.AWS_OIDC_ROLE_ARN }}" ] || { echo "Missing AWS_OIDC_ROLE_ARN"; exit 1; }
+          [ -n "${{ secrets.AWS_LAMBDA_ROLE_ARN }}" ] || { echo "Missing AWS_LAMBDA_ROLE_ARN"; exit 1; }
+          [ -n "${AWS_REGION}" ] || { echo "Missing AWS_REGION"; exit 1; }
+          [ -n "${AWS_ACCOUNT_ID}" ] || { echo "Missing AWS_ACCOUNT_ID"; exit 1; }
 
       # 1) Configure AWS via OIDC
       - uses: aws-actions/configure-aws-credentials@v4
@@ -31,28 +41,83 @@ jobs:
       - name: Ensure ECR repository
         id: ecr
         run: |
+          set -e
           aws ecr describe-repositories --repository-names "$ECR_REPO" >/dev/null 2>&1 || \
           aws ecr create-repository --repository-name "$ECR_REPO" >/dev/null
           echo "repo_uri=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}" >> $GITHUB_OUTPUT
 
-      # 3) Login to ECR
+      # 3) Enforce ECR repo policy so Lambda can pull (same account/region)
+      - name: Allow Lambda to pull from ECR
+        run: |
+          cat > policy.json <<'JSON'
+          {
+            "Version": "2008-10-17",
+            "Statement": [
+              {
+                "Sid": "AllowLambdaPullInAccount",
+                "Effect": "Allow",
+                "Principal": { "Service": "lambda.amazonaws.com" },
+                "Action": [
+                  "ecr:BatchGetImage",
+                  "ecr:GetDownloadUrlForLayer"
+                ],
+                "Condition": {
+                  "StringEquals": {
+                    "aws:SourceAccount": "${{ secrets.AWS_ACCOUNT_ID }}"
+                  },
+                  "ArnLike": {
+                    "aws:SourceArn": "arn:aws:lambda:${{ secrets.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:function:*"
+                  }
+                }
+              }
+            ]
+          }
+          JSON
+          aws ecr set-repository-policy \
+            --repository-name "$ECR_REPO" \
+            --policy-text file://policy.json \
+            --region "${AWS_REGION}"
+          echo "Current repo policy:"
+          aws ecr get-repository-policy --repository-name "$ECR_REPO" --region "${AWS_REGION}" --query policyText --output text
+
+      # 4) Login to ECR
       - uses: aws-actions/amazon-ecr-login@v2
 
-      # 4) Build & push image
+      # 5) Build & push image (tagged with commit SHA)
       - name: Build and push image
+        id: build
         run: |
-          IMAGE_URI="${{ steps.ecr.outputs.repo_uri }}:${IMAGE_TAG}"
-          docker build -t "$IMAGE_URI" .
-          docker push "$IMAGE_URI"
-          echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
-
-      # 5) Create Lambda function if missing, else update code
-      - name: Create or update Lambda function
-        id: deploy
-        run: |
-          IMAGE_URI="${{ steps.ecr.outputs.repo_uri }}:${IMAGE_TAG}"
           set -e
+          IMAGE_TAGGED="${{ steps.ecr.outputs.repo_uri }}:${IMAGE_TAG}"
+          docker build -t "$IMAGE_TAGGED" .
+          docker push "$IMAGE_TAGGED"
+          echo "image_tagged=$IMAGE_TAGGED" >> $GITHUB_OUTPUT
+          echo "Pushed $IMAGE_TAGGED"
 
+      # 6) Resolve image DIGEST and deploy by digest (safer than tags)
+      - name: Resolve image digest
+        id: digest
+        run: |
+          set -e
+          DIGEST=$(aws ecr describe-images \
+            --repository-name "$ECR_REPO" \
+            --image-ids imageTag="${IMAGE_TAG}" \
+            --region "${AWS_REGION}" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)
+          if [ -z "$DIGEST" ] || [ "$DIGEST" = "None" ]; then
+            echo "ECR image tag not found: ${{ steps.ecr.outputs.repo_uri }}:${IMAGE_TAG}"
+            exit 1
+          fi
+          IMAGE_URI="${{ steps.ecr.outputs.repo_uri }}@${DIGEST}"
+          echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "Using ImageUri: $IMAGE_URI"
+
+      # 7) Create Lambda if missing; otherwise update code (by digest)
+      - name: Create or update Lambda function
+        run: |
+          set -e
+          IMAGE_URI="${{ steps.digest.outputs.image_uri }}"
           if aws lambda get-function --function-name "$LAMBDA_FUNCTION" >/dev/null 2>&1; then
             echo "Updating existing Lambda code..."
             aws lambda update-function-code \
@@ -69,16 +134,19 @@ jobs:
               --memory-size 2048 >/dev/null
           fi
 
-      # 6) (Optional) Update environment variables from GitHub secrets
+      # 8) Update Lambda environment variables (shell-guarded; no 'secrets' in if:)
       - name: Update Lambda environment variables
-        if: ${{ env.BING_SUBSCRIPTION_KEY != '' || secrets.BING_SUBSCRIPTION_KEY != '' }}
         run: |
-          # add any envs you need here
-          aws lambda update-function-configuration \
-            --function-name "$LAMBDA_FUNCTION" \
-            --environment "Variables={BING_SUBSCRIPTION_KEY=${{ secrets.BING_SUBSCRIPTION_KEY }},PYTHONUNBUFFERED=1}"
+          if [ -n "${{ secrets.BING_SUBSCRIPTION_KEY }}" ]; then
+            echo "Setting BING_SUBSCRIPTION_KEY on Lambda…"
+            aws lambda update-function-configuration \
+              --function-name "$LAMBDA_FUNCTION" \
+              --environment "Variables={BING_SUBSCRIPTION_KEY=${{ secrets.BING_SUBSCRIPTION_KEY }},PYTHONUNBUFFERED=1}"
+          else
+            echo "No BING_SUBSCRIPTION_KEY secret set; skipping."
+          fi
 
-      # 7) Output function ARN
+      # 9) Show Lambda details
       - name: Show Lambda details
         run: |
-          aws lambda get-function --function-name "$LAMBDA_FUNCTION" --query 'Configuration.FunctionArn' --output text
+          aws lambda get-function --function-name "$LAMBDA_FUNCTION" --query 'Configuration.[FunctionArn,LastModified,PackageType,Timeout,MemorySize,ImageUri]' --output table
