@@ -3,7 +3,7 @@
 # --- Stage 0: fetch the Lambda Web Adapter binary ---
 FROM public.ecr.aws/awsguru/aws-lambda-adapter:0.8.3 AS lambda-adapter
 
-# --- Stage 1: your Lambda runtime image ---
+# --- Stage 1: Lambda runtime image ---
 FROM public.ecr.aws/lambda/python:3.11
 
 ENV PYTHONUNBUFFERED=1
@@ -16,15 +16,17 @@ RUN pip install --no-cache-dir -r requirements.txt
 # App code
 COPY pricing ./pricing
 
-# Copy the adapter binary FROM the adapter image (note the source path!)
+# Copy adapter binary and make it executable
 COPY --from=lambda-adapter /lambda-adapter /aws-lambda-adapter
 RUN chmod +x /aws-lambda-adapter
 
-# Adapter configuration
-ENV AWS_LAMBDA_EXEC_WRAPPER=/aws-lambda-adapter \
-    PORT=8080 \
+# Adapter config
+ENV PORT=8080 \
     AWS_LWA_READINESS_CHECK_PATH=/health \
     AWS_LWA_INVOKE_MODE=response_stream
 
-# Start FastAPI via Uvicorn (make sure pricing/portal.py defines `app`)
+# 👇 This is the key change: make the adapter the container entrypoint
+ENTRYPOINT ["/aws-lambda-adapter"]
+
+# Start FastAPI via Uvicorn (module:variable must resolve)
 CMD ["uvicorn", "pricing.portal:app", "--host", "0.0.0.0", "--port", "8080"]
