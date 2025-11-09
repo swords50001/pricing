@@ -1,37 +1,31 @@
 # syntax=docker/dockerfile:1
 
-# --- Stage 0: fetch the Lambda Web Adapter binary (official image) ---
+# --- Stage 0: fetch the Lambda Web Adapter binary ---
 FROM public.ecr.aws/awsguru/aws-lambda-adapter:0.8.3 AS lambda-adapter
 
-# --- Stage 1: run on plain Python, let the adapter be PID 1 ---
-FROM python:3.11-slim
+# --- Stage 1: AWS Lambda Python base image ---
+FROM public.ecr.aws/lambda/python:3.11
 
 ENV PYTHONUNBUFFERED=1
-WORKDIR /app
+WORKDIR ${LAMBDA_TASK_ROOT}
 
-# OS deps (lean). Add build deps only if your libs need them.
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
-
-# Python deps
+# Install Python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# App code (make sure pricing/__init__.py exists and does NOT import portal)
+# Copy app code (pricing must be a package and **not** import portal in __init__.py)
 COPY pricing ./pricing
 
-# Copy adapter binary in as entrypoint
-COPY --from=lambda-adapter /lambda-adapter /aws-lambda-adapter
-RUN chmod +x /aws-lambda-adapter
+# Put the adapter where the Lambda runtime expects the exec wrapper
+COPY --from=lambda-adapter /lambda-adapter /lambda-adapter
+RUN chmod +x /lambda-adapter
 
-# Adapter configuration
-ENV PORT=8080 \
+# Exec-wrapper mode: the adapter wraps the Lambda runtime and runs our CMD
+ENV AWS_LAMBDA_EXEC_WRAPPER=/lambda-adapter \
+    PORT=8080 \
     AWS_LWA_READINESS_CHECK_PATH=/health \
     AWS_LWA_INVOKE_MODE=response_stream \
     AWS_LWA_LOG_LEVEL=debug
 
-# The adapter is the ENTRYPOINT; it launches whatever is in CMD
-ENTRYPOINT ["/aws-lambda-adapter"]
-
-# Start FastAPI via Uvicorn (portal app must export `app`)
+# Single CMD: start FastAPI (portal exports `app`)
 CMD ["uvicorn", "pricing.portal:app", "--host", "0.0.0.0", "--port", "8080", "--proxy-headers", "--log-level", "info"]
