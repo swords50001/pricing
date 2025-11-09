@@ -20,4 +20,4 @@ ENV AWS_LWA_READINESS_CHECK_PATH=/health
 ENV AWS_LWA_INVOKE_MODE=response_stream
 
 # Your existing CMD is perfect (uvicorn on 0.0.0.0:8080)
-# CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "pricing.portal:app", "--host", "0.0.0.0", "--port", "8080"]
