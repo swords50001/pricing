@@ -87,7 +87,7 @@ def _resolve_domains(args: argparse.Namespace) -> Optional[List[str]]:
         # Explicit --base-url: honour legacy single-endpoint mode.
         return None
 
-    domains: List[str] = list(args.domains or [])
+    domains: List[str] = args.domains or []
 
     if args.domains_file is not None:
         try:

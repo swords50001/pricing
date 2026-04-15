@@ -22,6 +22,7 @@ DEFAULT_DOMAINS: List[str] = [
 ]
 
 _DDGO_SEARCH_URL = "https://html.duckduckgo.com/html/"
+_MAX_RESULTS_PER_DOMAIN = 3  # maximum product pages inspected per domain per query
 _USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -208,7 +209,7 @@ class ClothingPriceModel:
             f"{_DDGO_SEARCH_URL}?{urlencode({'q': ddg_query})}",
             self.timeout,
         )
-        urls = _extract_ddg_urls(ddg_html)[:3]  # inspect at most 3 result pages
+        urls = _extract_ddg_urls(ddg_html)[:_MAX_RESULTS_PER_DOMAIN]
         products: List[_Product] = []
         for url in urls:
             try:
