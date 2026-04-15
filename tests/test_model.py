@@ -2,7 +2,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from pricing.model import ClothingPriceModel, RemoteLookupError
+from pricing.model import (
+    ClothingPriceModel,
+    DEFAULT_DOMAINS,
+    RemoteLookupError,
+    _extract_ddg_urls,
+    _extract_product_from_page,
+    _parse_jsonld_product,
+    _extract_price_from_offers,
+)
 
 
 def test_batch_search_returns_online_matches():
@@ -77,3 +85,243 @@ def test_fetch_products_filters_invalid_entries(payload, expected_count):
         {"q": "Zara Jeans", "limit": str(model.limit)},
         model.timeout,
     )
+
+
+# ---------------------------------------------------------------------------
+# Domain-based search tests
+# ---------------------------------------------------------------------------
+
+_DDG_HTML_TEMPLATE = """\
+<html><body>
+<div class="result">
+  <a rel="nofollow" class="result__a"
+     href="//duckduckgo.com/l/?uddg={encoded_url}&rut=abc">Product page</a>
+</div>
+</body></html>
+"""
+
+_PRODUCT_PAGE_JSONLD = """\
+<html><head>
+<script type="application/ld+json">
+{{
+  "@context": "https://schema.org",
+  "@type": "Product",
+  "name": "{title}",
+  "brand": {{"@type": "Brand", "name": "{brand}"}},
+  "offers": {{
+    "@type": "Offer",
+    "price": "{price}",
+    "priceCurrency": "USD"
+  }}
+}}
+</script>
+</head><body></body></html>
+"""
+
+
+def _build_ddg_html(url: str) -> str:
+    from urllib.parse import quote
+    return _DDG_HTML_TEMPLATE.format(encoded_url=quote(url, safe=""))
+
+
+def _build_product_page(brand: str, title: str, price: str) -> str:
+    return _PRODUCT_PAGE_JSONLD.format(brand=brand, title=title, price=price)
+
+
+def test_default_domains_not_empty():
+    assert isinstance(DEFAULT_DOMAINS, list)
+    assert len(DEFAULT_DOMAINS) > 0
+    for domain in DEFAULT_DOMAINS:
+        assert "." in domain
+
+
+def test_domain_mode_queries_ddg_and_fetches_pages():
+    product_url = "https://www.example-store.com/product/pegasus"
+    ddg_html = _build_ddg_html(product_url)
+    product_html = _build_product_page("Nike", "Air Zoom Pegasus 40", "130.00")
+
+    http_get_raw = MagicMock(side_effect=[ddg_html, product_html])
+
+    model = ClothingPriceModel(
+        domains=["www.example-store.com"],
+        limit=5,
+        http_get_raw=http_get_raw,
+    )
+
+    results = model.batch_search([("Nike", "Pegasus 40")], min_score=0.3)
+
+    assert http_get_raw.call_count == 2
+    assert results[0] is not None
+    assert results[0].brand == "Nike"
+    assert results[0].price == 130.0
+
+
+def test_domain_mode_skips_failing_domains():
+    """Errors from individual domains must not crash the run."""
+    http_get_raw = MagicMock(side_effect=RemoteLookupError("timeout"))
+
+    model = ClothingPriceModel(
+        domains=["www.broken-store.com"],
+        limit=5,
+        http_get_raw=http_get_raw,
+    )
+
+    results = model.batch_search([("Nike", "Pegasus 40")])
+
+    assert results == [None]
+
+
+def test_domain_mode_multiple_domains_stops_at_limit():
+    """Results are capped at --limit across all domains."""
+    product_url = "https://www.store-a.com/p/1"
+    ddg_html = _build_ddg_html(product_url)
+    product_html = _build_product_page("Nike", "Pegasus 40", "129.99")
+
+    http_get_raw = MagicMock(return_value=ddg_html)
+    # Second call per domain fetches the product page
+    http_get_raw.side_effect = [ddg_html, product_html, ddg_html, product_html]
+
+    model = ClothingPriceModel(
+        domains=["www.store-a.com", "www.store-b.com"],
+        limit=1,
+        http_get_raw=http_get_raw,
+    )
+    products = model._fetch_products_from_domains("Nike", "Pegasus 40")
+    # limit=1 so should return at most 1 product
+    assert len(products) <= 1
+
+
+def test_domain_mode_empty_ddg_response_skips_page_fetch():
+    """When DDG returns no result URLs, no product pages should be fetched."""
+    http_get_raw = MagicMock(return_value="<html><body>No results</body></html>")
+
+    model = ClothingPriceModel(
+        domains=["www.example-store.com"],
+        limit=5,
+        http_get_raw=http_get_raw,
+    )
+    products = model._fetch_products("Nike", "Pegasus 40")
+    # Only the DDG search request was made; no product page fetches
+    assert http_get_raw.call_count == 1
+    assert products == []
+
+
+def test_extract_ddg_urls_parses_uddg_links():
+    from urllib.parse import quote
+    url = "https://www.nordstrom.com/product/pegasus"
+    html = f'<a href="//duckduckgo.com/l/?uddg={quote(url, safe="")}&rut=x">link</a>'
+    urls = _extract_ddg_urls(html)
+    assert urls == [url]
+
+
+def test_extract_ddg_urls_fallback_direct_href():
+    html = '<a class="result__a" href="https://www.zappos.com/product/shoes">shoes</a>'
+    urls = _extract_ddg_urls(html)
+    assert urls == ["https://www.zappos.com/product/shoes"]
+
+
+def test_extract_ddg_urls_ignores_non_http():
+    html = '<a href="//duckduckgo.com/l/?uddg=ftp%3A%2F%2Fold.server%2Ffile">x</a>'
+    urls = _extract_ddg_urls(html)
+    assert urls == []
+
+
+def test_parse_jsonld_product_extracts_fields():
+    data = {
+        "@type": "Product",
+        "name": "Wide Leg Jeans",
+        "brand": {"@type": "Brand", "name": "Zara"},
+        "offers": {"@type": "Offer", "price": "59.90"},
+    }
+    product = _parse_jsonld_product(data, "www.zara.com")
+    assert product is not None
+    assert product.brand == "Zara"
+    assert product.title == "Wide Leg Jeans"
+    assert product.price == pytest.approx(59.90)
+
+
+def test_parse_jsonld_product_list_type():
+    data = {
+        "@type": ["Product", "Thing"],
+        "name": "T-Shirt",
+        "offers": {"price": "19.99"},
+    }
+    product = _parse_jsonld_product(data, "www.gap.com")
+    assert product is not None
+    assert product.title == "T-Shirt"
+    assert product.price == pytest.approx(19.99)
+    # brand defaults to domain when not present
+    assert product.brand == "www.gap.com"
+
+
+def test_parse_jsonld_product_aggregate_offer():
+    data = {
+        "@type": "Product",
+        "name": "Sneakers",
+        "offers": {"@type": "AggregateOffer", "lowPrice": "89.00", "highPrice": "120.00"},
+    }
+    product = _parse_jsonld_product(data, "www.store.com")
+    assert product is not None
+    assert product.price == pytest.approx(89.00)
+
+
+def test_parse_jsonld_product_returns_none_without_price():
+    data = {"@type": "Product", "name": "Jacket"}
+    assert _parse_jsonld_product(data, "domain") is None
+
+
+def test_parse_jsonld_product_returns_none_wrong_type():
+    data = {"@type": "Organization", "name": "Nike Inc"}
+    assert _parse_jsonld_product(data, "domain") is None
+
+
+def test_extract_price_from_offers_list():
+    offers = [
+        {"@type": "Offer", "price": "45.00"},
+        {"@type": "Offer", "price": "50.00"},
+    ]
+    assert _extract_price_from_offers(offers) == pytest.approx(45.00)
+
+
+def test_extract_price_from_offers_none():
+    assert _extract_price_from_offers(None) is None
+    assert _extract_price_from_offers("not an offer") is None
+
+
+def test_extract_product_from_page_jsonld():
+    html = _build_product_page("Adidas", "Ultraboost Light", "190.00")
+    product = _extract_product_from_page(html, "www.adidas.com", "Adidas")
+    assert product is not None
+    assert product.brand == "Adidas"
+    assert product.title == "Ultraboost Light"
+    assert product.price == pytest.approx(190.00)
+
+
+def test_extract_product_from_page_meta_fallback():
+    html = (
+        '<html><head>'
+        '<meta property="og:title" content="Pegasus 40"/>'
+        '<meta property="product:price:amount" content="130.00"/>'
+        '</head><body></body></html>'
+    )
+    product = _extract_product_from_page(html, "www.nike.com", "Nike")
+    assert product is not None
+    assert product.title == "Pegasus 40"
+    assert product.price == pytest.approx(130.00)
+
+
+def test_extract_product_from_page_returns_none_for_blank_page():
+    assert _extract_product_from_page("<html><body>No data</body></html>", "domain", "brand") is None
+
+
+def test_base_url_mode_unaffected_by_domain_param():
+    """Passing domains=None should keep legacy base-URL behaviour."""
+    http_get = MagicMock(return_value={"products": []})
+    model = ClothingPriceModel(http_get=http_get, domains=None)
+    model._fetch_products("Nike", "Shoes")
+    http_get.assert_called_once_with(
+        model.base_url,
+        {"q": "Nike Shoes", "limit": str(model.limit)},
+        model.timeout,
+    )
+
