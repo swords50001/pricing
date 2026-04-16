@@ -28,17 +28,16 @@ from mangum import Mangum
 class PortalConfig:
     """Default configuration for the pricing portal."""
 
-    base_url: str = "https://dummyjson.com/products/search"
     limit: int = 10
     timeout: float = 10.0
     min_score: float = 0.45
 
 
-ModelFactory = Callable[[str, int, float], ClothingPriceModel]
+ModelFactory = Callable[[int, float], ClothingPriceModel]
 
 
-def _default_model_factory(base_url: str, limit: int, timeout: float) -> ClothingPriceModel:
-    return ClothingPriceModel(web_search=False, base_url=base_url, limit=limit, timeout=timeout)
+def _default_model_factory(limit: int, timeout: float) -> ClothingPriceModel:
+    return ClothingPriceModel(web_search=True, limit=limit, timeout=timeout)
 
 
 # =============================================================================
@@ -114,9 +113,7 @@ class _PricingPortalRequestHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            model = type(self).model_factory(
-                form_values["base_url"], form_values["limit"], form_values["timeout"]
-            )
+            model = type(self).model_factory(form_values["limit"], form_values["timeout"])
         except Exception as exc:  # pragma: no cover - defensive fallback
             self._render_page(
                 error=f"Failed to initialise price model: {exc}",
@@ -157,7 +154,6 @@ class _PricingPortalRequestHandler(BaseHTTPRequestHandler):
         download_href: Optional[str] = None,
     ) -> None:
         values = form_values or {
-            "base_url": self.config.base_url,
             "limit": str(self.config.limit),
             "timeout": str(self.config.timeout),
             "min_score": str(self.config.min_score),
@@ -188,8 +184,6 @@ def _extract_form_values(form: cgi.FieldStorage, config: PortalConfig) -> dict |
         if value is None:
             return default
         return str(value).strip() or default
-
-    base_url = _get("base_url", config.base_url)
 
     def _parse_int(name: str, default: int, minimum: int) -> int | str:
         raw = _get(name, str(default))
@@ -244,7 +238,6 @@ def _extract_form_values(form: cgi.FieldStorage, config: PortalConfig) -> dict |
         return min_score
 
     return {
-        "base_url": base_url,
         "limit": limit,
         "timeout": timeout,
         "min_score": min_score,
@@ -395,8 +388,6 @@ def _render_template(
   <p>Upload a CSV containing <code>brand</code> and <code>title</code> columns to fetch live pricing data.</p>
   {message_html}
   <form method=\"post\" enctype=\"multipart/form-data\" action=\"/upload\">
-    <label for=\"base_url\">Product search API URL</label>
-    <input id=\"base_url\" name=\"base_url\" type=\"text\" value=\"{_escape(values['base_url'])}\" />
     <label for=\"limit\">Results per request</label>
     <input id=\"limit\" name=\"limit\" type=\"number\" min=\"1\" value=\"{_escape(values['limit'])}\" />
     <label for=\"timeout\">Request timeout (seconds)</label>
@@ -446,11 +437,6 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1", help="Host interface to bind the portal server to.")
     parser.add_argument("--port", type=int, default=8000, help="Port to bind the portal server to.")
     parser.add_argument(
-        "--base-url",
-        default=PortalConfig.base_url,
-        help="Remote product search endpoint that will be queried for prices.",
-    )
-    parser.add_argument(
         "--limit",
         type=int,
         default=PortalConfig.limit,
@@ -474,7 +460,6 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[Iterable[str]] = None) -> int:
     args = parse_args(argv)
     config = PortalConfig(
-        base_url=args.base_url,
         limit=args.limit,
         timeout=args.timeout,
         min_score=args.min_score,
@@ -509,7 +494,6 @@ def form() -> HTMLResponse:
     html_text = _render_template(
         config=cfg,
         values={
-            "base_url": cfg.base_url,
             "limit": str(cfg.limit),
             "timeout": str(cfg.timeout),
             "min_score": str(cfg.min_score),
@@ -525,7 +509,6 @@ def form() -> HTMLResponse:
 
 @app.post("/upload", response_class=HTMLResponse)
 async def upload(
-    base_url: str = Form(PortalConfig.base_url),
     limit: int = Form(PortalConfig.limit),
     timeout: float = Form(PortalConfig.timeout),
     min_score: float = Form(PortalConfig.min_score),
@@ -536,11 +519,10 @@ async def upload(
     parsed = _parse_queries_bytes(data)
     if isinstance(parsed, str):
         # Render page with error message
-        cfg = PortalConfig(base_url=base_url, limit=limit, timeout=timeout, min_score=min_score)
+        cfg = PortalConfig(limit=limit, timeout=timeout, min_score=min_score)
         html_text = _render_template(
             config=cfg,
             values={
-                "base_url": base_url,
                 "limit": str(limit),
                 "timeout": str(timeout),
                 "min_score": str(min_score),
@@ -555,11 +537,10 @@ async def upload(
 
     queries_list = parsed
     if not queries_list:
-        cfg = PortalConfig(base_url=base_url, limit=limit, timeout=timeout, min_score=min_score)
+        cfg = PortalConfig(limit=limit, timeout=timeout, min_score=min_score)
         html_text = _render_template(
             config=cfg,
             values={
-                "base_url": base_url,
                 "limit": str(limit),
                 "timeout": str(timeout),
                 "min_score": str(min_score),
@@ -573,7 +554,7 @@ async def upload(
         return HTMLResponse(content=html_text)
 
     # Run model batch search
-    model = _default_model_factory(base_url=base_url, limit=limit, timeout=timeout)
+    model = _default_model_factory(limit=limit, timeout=timeout)
     try:
         results = model.batch_search(queries_list, min_score=min_score)
     finally:
@@ -582,11 +563,10 @@ async def upload(
     table_rows, csv_payload = _build_results_output(queries_list, results)
     download_href = f"data:text/csv;charset=utf-8,{quote(csv_payload)}"
 
-    cfg = PortalConfig(base_url=base_url, limit=limit, timeout=timeout, min_score=min_score)
+    cfg = PortalConfig(limit=limit, timeout=timeout, min_score=min_score)
     html_text = _render_template(
         config=cfg,
         values={
-            "base_url": base_url,
             "limit": str(limit),
             "timeout": str(timeout),
             "min_score": str(min_score),
@@ -609,7 +589,6 @@ async def search_api(payload: dict) -> JSONResponse:
       or:   { "pairs": [ ["Nike","Air Force 1"], ["Adidas","Campus 00s"] ] }
     Returns a list of results with price (or null if not found).
     """
-    base_url = payload.get("base_url", PortalConfig.base_url)
     limit = int(payload.get("limit", PortalConfig.limit))
     timeout = float(payload.get("timeout", PortalConfig.timeout))
     min_score = float(payload.get("min_score", PortalConfig.min_score))
@@ -624,7 +603,7 @@ async def search_api(payload: dict) -> JSONResponse:
             raise HTTPException(status_code=400, detail="Provide 'brand' and 'title' or 'pairs'.")
         pairs = [(brand, title)]
 
-    model = _default_model_factory(base_url=base_url, limit=limit, timeout=timeout)
+    model = _default_model_factory(limit=limit, timeout=timeout)
     try:
         results = model.batch_search(pairs, min_score=min_score)
     finally:

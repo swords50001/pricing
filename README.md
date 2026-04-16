@@ -72,7 +72,7 @@ python -m pricing.portal --port 8000
 ```
 
 Open `http://127.0.0.1:8000` in your browser, supply the CSV containing `brand` and `title` columns, and press **Find Prices**.
-The portal will call the same remote API as the CLI, show the matched prices in a table, and provide a download link for a fresh
+The portal uses the same DuckDuckGo-powered open-web search flow as the CLI, shows the matched prices in a table, and provides a download link for a fresh
 `brand,title,price` CSV.
 
 ## Library usage

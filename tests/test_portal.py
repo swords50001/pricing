@@ -4,9 +4,9 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 
-from pricing import PortalConfig
 from pricing.model import SearchResult
 from pricing import portal
+from pricing.portal import PortalConfig
 
 
 @pytest.mark.parametrize(
@@ -67,9 +67,8 @@ def test_portal_serves_results():
     config = PortalConfig()
     created_models = []
 
-    def model_factory(base_url, limit, timeout):
+    def model_factory(limit, timeout):
         model = _StubModel()
-        model.base_url = base_url
         model.limit = limit
         model.timeout = timeout
         created_models.append(model)
@@ -86,7 +85,6 @@ def test_portal_serves_results():
         body = _multipart_form(
             boundary,
             [
-                ("base_url", "https://example.com/api"),
                 ("limit", "5"),
                 ("timeout", "3.5"),
                 ("min_score", "0.25"),
@@ -115,7 +113,6 @@ def test_portal_serves_results():
 
     assert created_models, "Expected model factory to be invoked"
     model = created_models[0]
-    assert model.base_url == "https://example.com/api"
     assert model.limit == 5
     assert model.timeout == 3.5
     assert model.received_queries == [
@@ -124,3 +121,64 @@ def test_portal_serves_results():
     ]
     assert pytest.approx(model.min_score) == 0.25
     assert model.closed is True
+
+
+def test_default_model_factory_enables_web_search(monkeypatch):
+    captured = {}
+
+    class _StubClothingPriceModel:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(portal, "ClothingPriceModel", _StubClothingPriceModel)
+    portal._default_model_factory(limit=7, timeout=2.5)
+
+    assert captured == {"web_search": True, "limit": 7, "timeout": 2.5}
+
+
+def test_form_does_not_include_base_url_field():
+    response = portal.form()
+    body = response.body.decode("utf-8")
+    assert 'name="base_url"' not in body
+    assert "Product search API URL" not in body
+
+
+def test_search_api_ignores_base_url_payload_key(monkeypatch):
+    import asyncio
+
+    created = {}
+
+    class _StubModel:
+        def batch_search(self, queries, *, min_score):
+            created["queries"] = list(queries)
+            created["min_score"] = min_score
+            return [SearchResult(brand="Nike", title="Pegasus 40", price=120.0, score=0.9)]
+
+        def close(self):
+            created["closed"] = True
+
+    def _stub_factory(limit, timeout):
+        created["limit"] = limit
+        created["timeout"] = timeout
+        return _StubModel()
+
+    monkeypatch.setattr(portal, "_default_model_factory", _stub_factory)
+    response = asyncio.run(
+        portal.search_api(
+            {
+                "brand": "Nike",
+                "title": "Pegasus 40",
+                "base_url": "https://example.com/legacy",
+                "limit": 5,
+                "timeout": 2.5,
+                "min_score": 0.2,
+            }
+        )
+    )
+
+    assert response.body == b'{"results":[{"brand":"Nike","title":"Pegasus 40","price":120.0,"found":true}]}'
+    assert created["limit"] == 5
+    assert created["timeout"] == 2.5
+    assert created["queries"] == [("Nike", "Pegasus 40")]
+    assert created["min_score"] == 0.2
+    assert created["closed"] is True
