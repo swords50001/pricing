@@ -9,7 +9,7 @@ import re
 import unicodedata
 from difflib import SequenceMatcher
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urlencode
+from urllib.parse import unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 # Default store domains used when no explicit domain list is provided.
@@ -23,6 +23,7 @@ DEFAULT_DOMAINS: List[str] = [
 
 _DDGO_SEARCH_URL = "https://html.duckduckgo.com/html/"
 _MAX_RESULTS_PER_DOMAIN = 3  # maximum product pages inspected per domain per query
+_MAX_WEB_RESULTS = 10        # maximum result pages fetched during open web search
 _USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -59,19 +60,21 @@ class _Product:
 class ClothingPriceModel:
     """Fetches clothing prices by querying remote product search sources.
 
-    Two search strategies are supported:
+    Three search strategies are supported (selected at construction time):
 
-    * **Base-URL mode** (legacy): a single JSON API endpoint is queried with
-      ``q`` and ``limit`` parameters and must return a ``products`` list
-      containing ``brand``, ``title`` and ``price`` fields.
-    * **Domain mode**: DuckDuckGo HTML search is used to find product pages on
-      each domain in ``domains``.  Prices are extracted from schema.org
-      JSON-LD or ``<meta>`` tags on the discovered pages.  Errors from any
-      single domain are silently skipped.
+    * **Web search mode** (default, ``web_search=True``, ``domains=None``):
+      An open DuckDuckGo HTML search for ``{brand} {title} price buy`` is
+      performed with no domain restriction.  The top result pages are fetched
+      and prices are extracted from schema.org JSON-LD or ``<meta>`` tags.
+    * **Domain-filtered web search** (``web_search=True``, ``domains=[...]``):
+      Same DuckDuckGo approach but each search includes a ``site:domain``
+      restriction so only pages from the given stores are visited.  Errors
+      from individual domains are silently skipped.
+    * **Base-URL mode** (legacy, ``web_search=False``): A single JSON API
+      endpoint is queried with ``q`` and ``limit`` parameters and must return
+      a ``products`` list containing ``brand``, ``title`` and ``price`` fields.
 
-    When ``domains`` is ``None`` the model falls back to base-URL mode.
-    Pass ``domains=DEFAULT_DOMAINS`` (or any non-empty list) to activate
-    domain-based search.
+    In all modes the existing scoring logic is used to select the best match.
     """
 
     def __init__(
@@ -79,6 +82,7 @@ class ClothingPriceModel:
         *,
         base_url: str = "https://dummyjson.com/products/search",
         domains: Optional[List[str]] = None,
+        web_search: bool = True,
         limit: int = 10,
         timeout: float = 10.0,
         http_get: Optional[Callable[[str, Dict[str, str], float], Dict[str, object]]] = None,
@@ -90,6 +94,7 @@ class ClothingPriceModel:
             raise ValueError("timeout must be positive")
         self.base_url = base_url
         self.domains = domains
+        self.web_search = web_search
         self.limit = limit
         self.timeout = timeout
         self._http_get = http_get or _default_http_get
@@ -162,8 +167,10 @@ class ClothingPriceModel:
         )
 
     def _fetch_products(self, brand: str, title: str) -> List[_Product]:
-        if self.domains is not None:
-            return self._fetch_products_from_domains(brand, title)
+        if self.web_search:
+            if self.domains is not None:
+                return self._fetch_products_from_domains(brand, title)
+            return self._fetch_products_from_web(brand, title)
         # Legacy base-URL mode
         query = f"{brand} {title}".strip()
         payload = self._http_get(
@@ -214,6 +221,31 @@ class ClothingPriceModel:
         for url in urls:
             try:
                 page_html = self._http_get_raw(url, self.timeout)
+                product = _extract_product_from_page(page_html, domain, brand)
+                if product is not None:
+                    products.append(product)
+            except RemoteLookupError:
+                continue
+        return products
+
+    def _fetch_products_from_web(self, brand: str, title: str) -> List[_Product]:
+        """Open-web DuckDuckGo search with no domain restriction."""
+        query = f"{brand} {title} price buy".strip()
+        try:
+            ddg_html = self._http_get_raw(
+                f"{_DDGO_SEARCH_URL}?{urlencode({'q': query})}",
+                self.timeout,
+            )
+        except RemoteLookupError:
+            return []
+        urls = _extract_ddg_urls(ddg_html)[: min(self.limit, _MAX_WEB_RESULTS)]
+        products: List[_Product] = []
+        for url in urls:
+            if len(products) >= self.limit:
+                break
+            try:
+                page_html = self._http_get_raw(url, self.timeout)
+                domain = urlparse(url).netloc or url
                 product = _extract_product_from_page(page_html, domain, brand)
                 if product is not None:
                     products.append(product)

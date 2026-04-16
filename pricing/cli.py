@@ -7,11 +7,17 @@ import json
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
-from .model import ClothingPriceModel, DEFAULT_DOMAINS, SearchResult
+from .model import ClothingPriceModel, SearchResult
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Batch search clothing prices by brand and title")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Batch search clothing prices by brand and title. "
+            "By default the tool searches the open web via DuckDuckGo and extracts "
+            "prices from product pages using schema.org structured data."
+        )
+    )
     parser.add_argument(
         "queries",
         type=Path,
@@ -24,23 +30,22 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         help="Minimum score threshold required to return a price match. Lower returns more results but with lower confidence.",
     )
 
-    domain_group = parser.add_argument_group(
-        "domain search (default mode)",
-        "Search for prices across a fixed list of store domains using DuckDuckGo. "
-        "When --domain or --domains-file is provided, --base-url is ignored.",
+    filter_group = parser.add_argument_group(
+        "domain filter (optional)",
+        "Restrict the web search to specific store domains. "
+        "When omitted the search covers the entire open web.",
     )
-    domain_group.add_argument(
+    filter_group.add_argument(
         "--domain",
         dest="domains",
         action="append",
         metavar="DOMAIN",
         help=(
-            "Store domain to include in the price search "
-            "(e.g. www.nordstrom.com). May be repeated. "
-            "Defaults to a built-in list when omitted."
+            "Restrict results to this store domain (e.g. www.nordstrom.com). "
+            "May be repeated to include multiple stores."
         ),
     )
-    domain_group.add_argument(
+    filter_group.add_argument(
         "--domains-file",
         type=Path,
         metavar="FILE",
@@ -49,7 +54,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 
     legacy_group = parser.add_argument_group(
         "legacy single-endpoint mode",
-        "Query a single JSON product-search API. Deprecated: prefer --domain instead.",
+        "Query a single JSON product-search API instead of crawling the web. "
+        "Deprecated: prefer the default web-search mode.",
     )
     legacy_group.add_argument(
         "--base-url",
@@ -57,7 +63,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         metavar="URL",
         help=(
             "[Deprecated] Remote product search endpoint that returns a JSON "
-            "``products`` list. When supplied, domain-search arguments are ignored."
+            "``products`` list. Disables web crawling when supplied."
         ),
     )
 
@@ -65,7 +71,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         "--limit",
         type=int,
         default=10,
-        help="Maximum number of products to fetch per query.",
+        help="Maximum number of product pages to fetch per query.",
     )
     parser.add_argument(
         "--timeout",
@@ -82,11 +88,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 
 
 def _resolve_domains(args: argparse.Namespace) -> Optional[List[str]]:
-    """Return the list of domains to search, or *None* to use base-URL mode."""
-    if args.base_url is not None:
-        # Explicit --base-url: honour legacy single-endpoint mode.
-        return None
-
+    """Return an explicit domain filter list, or *None* for unrestricted search."""
     domains: List[str] = args.domains or []
 
     if args.domains_file is not None:
@@ -98,8 +100,7 @@ def _resolve_domains(args: argparse.Namespace) -> Optional[List[str]]:
         except OSError as exc:
             raise SystemExit(f"Cannot read domains file: {exc}") from exc
 
-    # If neither --domain nor --domains-file was given, use the built-in default list.
-    return domains if domains else DEFAULT_DOMAINS
+    return domains if domains else None
 
 
 def load_queries(path: Path) -> List[Tuple[str, str]]:
@@ -139,16 +140,19 @@ def main(argv: Iterable[str] | None = None) -> int:
     if not queries:
         raise SystemExit("No queries loaded from the provided file")
 
-    domains = _resolve_domains(args)
-    if domains is not None:
+    if args.base_url is not None:
+        # Legacy single-endpoint mode
         model = ClothingPriceModel(
-            domains=domains,
+            base_url=args.base_url,
+            web_search=False,
             limit=args.limit,
             timeout=args.timeout,
         )
     else:
+        # Web-search mode (default): optionally filtered to specific domains
         model = ClothingPriceModel(
-            base_url=args.base_url,
+            domains=_resolve_domains(args),
+            web_search=True,
             limit=args.limit,
             timeout=args.timeout,
         )

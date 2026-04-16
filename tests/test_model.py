@@ -30,7 +30,7 @@ def test_batch_search_returns_online_matches():
         ]
     )
 
-    model = ClothingPriceModel(http_get=http_get, limit=5)
+    model = ClothingPriceModel(http_get=http_get, web_search=False, limit=5)
 
     results = model.batch_search([("Nike", "Pegasus 40"), ("Adidas", "Ultraboost")], min_score=0.3)
 
@@ -44,7 +44,7 @@ def test_batch_search_returns_online_matches():
 def test_batch_search_handles_remote_errors():
     http_get = MagicMock(side_effect=RemoteLookupError("boom"))
 
-    model = ClothingPriceModel(http_get=http_get)
+    model = ClothingPriceModel(http_get=http_get, web_search=False)
 
     results = model.batch_search([("Brand", "Item")])
 
@@ -72,7 +72,7 @@ def test_batch_search_handles_remote_errors():
 def test_fetch_products_filters_invalid_entries(payload, expected_count):
     http_get = MagicMock(return_value=payload)
 
-    model = ClothingPriceModel(http_get=http_get)
+    model = ClothingPriceModel(http_get=http_get, web_search=False)
 
     products = model._fetch_products("Zara", "Jeans")
 
@@ -315,13 +315,96 @@ def test_extract_product_from_page_returns_none_for_blank_page():
 
 
 def test_base_url_mode_unaffected_by_domain_param():
-    """Passing domains=None should keep legacy base-URL behaviour."""
+    """web_search=False should use the legacy base-URL JSON API."""
     http_get = MagicMock(return_value={"products": []})
-    model = ClothingPriceModel(http_get=http_get, domains=None)
+    model = ClothingPriceModel(http_get=http_get, domains=None, web_search=False)
     model._fetch_products("Nike", "Shoes")
     http_get.assert_called_once_with(
         model.base_url,
         {"q": "Nike Shoes", "limit": str(model.limit)},
         model.timeout,
     )
+
+
+# ---------------------------------------------------------------------------
+# Open web search tests (new default)
+# ---------------------------------------------------------------------------
+
+def test_web_search_queries_ddg_without_site_restriction():
+    """Default mode does an unrestricted DuckDuckGo search."""
+    from urllib.parse import quote
+    product_url = "https://www.some-store.com/product/pegasus-40"
+    ddg_html = (
+        f'<a href="//duckduckgo.com/l/?uddg={quote(product_url, safe="")}&rut=x">'
+        'Pegasus 40</a>'
+    )
+    product_html = (
+        '<script type="application/ld+json">'
+        '{"@type":"Product","name":"Air Zoom Pegasus 40",'
+        '"brand":{"@type":"Brand","name":"Nike"},'
+        '"offers":{"@type":"Offer","price":"130.00"}}'
+        '</script>'
+    )
+    http_get_raw = MagicMock(side_effect=[ddg_html, product_html])
+
+    # Default constructor: web_search=True, domains=None
+    model = ClothingPriceModel(http_get_raw=http_get_raw, limit=5)
+
+    results = model.batch_search([("Nike", "Pegasus 40")], min_score=0.3)
+
+    # First call must be DuckDuckGo with no site: filter
+    ddg_call_url = http_get_raw.call_args_list[0][0][0]
+    assert "duckduckgo" in ddg_call_url
+    assert "site:" not in ddg_call_url
+
+    assert results[0] is not None
+    assert results[0].brand == "Nike"
+    assert results[0].price == pytest.approx(130.0)
+
+
+def test_web_search_handles_ddg_failure_gracefully():
+    """A DDG request error should not crash the run; return None."""
+    http_get_raw = MagicMock(side_effect=RemoteLookupError("network error"))
+    model = ClothingPriceModel(http_get_raw=http_get_raw)
+
+    results = model.batch_search([("Nike", "Pegasus 40")])
+    assert results == [None]
+
+
+def test_web_search_skips_pages_with_no_price():
+    """Pages that yield no product should be skipped; no crash."""
+    from urllib.parse import quote
+    url = "https://example.com/product/1"
+    ddg_html = f'<a href="//duckduckgo.com/l/?uddg={quote(url, safe="")}">x</a>'
+    product_html = "<html><body>No structured data here</body></html>"
+
+    http_get_raw = MagicMock(side_effect=[ddg_html, product_html])
+    model = ClothingPriceModel(http_get_raw=http_get_raw, limit=5)
+
+    results = model.batch_search([("Nike", "Pegasus 40")])
+    assert results == [None]
+
+
+def test_web_search_respects_limit():
+    """No more than limit pages should be fetched."""
+    from urllib.parse import quote
+
+    product_html = (
+        '<script type="application/ld+json">'
+        '{"@type":"Product","name":"Pegasus 40","offers":{"price":"130"}}'
+        '</script>'
+    )
+
+    # Build a DDG result page with 5 URLs
+    urls = [f"https://store{i}.com/product" for i in range(5)]
+    link_html = "".join(
+        f'<a href="//duckduckgo.com/l/?uddg={quote(u, safe="")}">x</a>' for u in urls
+    )
+    http_get_raw = MagicMock(side_effect=[link_html] + [product_html] * 5)
+
+    model = ClothingPriceModel(http_get_raw=http_get_raw, limit=2)
+    products = model._fetch_products_from_web("Nike", "Pegasus 40")
+
+    # Should stop after 2 successful extractions
+    assert len(products) <= 2
 
