@@ -9,6 +9,10 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import cgi
+from typing import Callable, Iterable, List, Optional, Tuple
+from urllib.parse import quote
+
+from .model import ClothingPriceModel, SearchResult
 from typing import Callable, Iterable, List, Optional, Tuple, Any
 from urllib.parse import quote
 
@@ -140,6 +144,7 @@ class _PricingPortalRequestHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: object) -> None:  # noqa: A003
         """Silence the default stderr logging for cleaner console output."""
+
         return None
 
     def _render_page(
@@ -390,6 +395,7 @@ def _render_template(
   <h1>Clothing Price Lookup Portal</h1>
   <p>Upload a CSV containing <code>brand</code> and <code>title</code> columns to fetch live pricing data.</p>
   {message_html}
+  <form method=\"post\" enctype=\"multipart/form-data\">
   <form method=\"post\" enctype=\"multipart/form-data\" action=\"/upload\">
     <label for=\"base_url\">Product search API URL</label>
     <input id=\"base_url\" name=\"base_url\" type=\"text\" value=\"{_escape(values['base_url'])}\" />
