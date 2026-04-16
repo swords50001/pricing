@@ -1,6 +1,6 @@
 # Pricing Lookup Model
 
-This repository contains a lightweight client for batch searching clothing prices by brand and item title. Instead of relying on static CSV data, the client reaches out to an online product search API (DummyJSON by default) and extracts pricing information for each query.
+This repository contains a lightweight client for batch searching clothing prices by brand and item title.  The tool **crawls the open web** by default: it runs a DuckDuckGo search for each query, fetches the top product pages, and extracts prices from schema.org JSON-LD or Open Graph meta tags — no API key required.
 
 ## Project layout
 
@@ -17,19 +17,49 @@ examples/
 
 ## Usage
 
-Create a virtual environment (optional but recommended) and run the CLI with the provided sample data. The command issues HTTP requests to the configured search API, so ensure you have internet access:
+Create a virtual environment (optional but recommended) and run the CLI with the provided sample data.  The command issues HTTP requests across the open web, so ensure you have internet access:
 
 ```
 python -m pricing.cli examples/queries.csv
 ```
 
-The command prints a JSON array describing the best match (if any) for each input row. Use the `--output` flag to write the data to disk.
+The tool searches DuckDuckGo for each `brand + title`, visits the top result pages, and extracts prices automatically.  Results are printed as a JSON array.  Use `--output` to write results to disk.
 
-To customise the remote endpoint, request size, or timeout, use the optional flags:
+### Restricting to specific stores (optional)
+
+Pass `--domain` to narrow the search to one or more stores:
 
 ```
-python -m pricing.cli my_queries.csv --base-url https://dummyjson.com/products/search --limit 15 --timeout 5
+python -m pricing.cli examples/queries.csv \
+  --domain www.nordstrom.com \
+  --domain www.zappos.com
 ```
+
+Or point at a plain-text file with one domain per line:
+
+```
+python -m pricing.cli examples/queries.csv --domains-file my_stores.txt
+```
+
+When `--domain` / `--domains-file` is provided, each DuckDuckGo query includes a `site:` restriction so only pages from those stores are visited.
+
+### Adjusting request settings
+
+```
+python -m pricing.cli examples/queries.csv --limit 15 --timeout 5
+```
+
+`--limit` controls how many result pages are fetched per query.
+
+### Legacy single-endpoint mode
+
+If you still need to query a single JSON product-search API (e.g. DummyJSON), pass `--base-url`.  This disables web crawling entirely:
+
+```
+python -m pricing.cli my_queries.csv --base-url https://dummyjson.com/products/search
+```
+
+> **Note:** `--base-url` is deprecated.  Prefer the default web-search mode.
 
 The query CSV must contain headers with `brand` and `title` columns.
 
@@ -42,21 +72,32 @@ python -m pricing.portal --port 8000
 ```
 
 Open `http://127.0.0.1:8000` in your browser, supply the CSV containing `brand` and `title` columns, and press **Find Prices**.
-The portal will call the same remote API as the CLI, show the matched prices in a table, and provide a download link for a fresh
+The portal will call the same search backend as the CLI, show the matched prices in a table, and provide a download link for a fresh
 `brand,title,price` CSV.
 
 ## Library usage
 
-You can also integrate the model directly into Python code:
-
 ```python
 from pricing.model import ClothingPriceModel
 
+# Default: open-web search (no domain restriction)
 model = ClothingPriceModel()
 queries = [("Nike", "Pegasus 40"), ("Zara", "Wide Leg Jeans")]
 results = model.batch_search(queries)
 for result in results:
     print(result)
+```
+
+To restrict to specific stores:
+
+```python
+model = ClothingPriceModel(domains=["www.zappos.com", "www.nordstrom.com"])
+```
+
+To use the legacy single-endpoint JSON API:
+
+```python
+model = ClothingPriceModel(web_search=False, base_url="https://dummyjson.com/products/search")
 ```
 
 Each result is either `None` (no confident match) or a `SearchResult` containing the matching brand, title, price, and similarity score.
