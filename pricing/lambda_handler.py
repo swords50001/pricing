@@ -15,7 +15,7 @@ class _ModelFactory:
     """Callable wrapper used for dependency injection in tests."""
 
     def __call__(self, base_url: str, limit: int, timeout: float) -> ClothingPriceModel:
-        return ClothingPriceModel(base_url=base_url, limit=limit, timeout=timeout)
+        return ClothingPriceModel(web_search=False, base_url=base_url, limit=limit, timeout=timeout)
 
 
 _model_factory: _ModelFactory = _ModelFactory()

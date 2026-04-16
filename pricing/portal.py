@@ -9,14 +9,10 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import cgi
-from typing import Callable, Iterable, List, Optional, Tuple
-from urllib.parse import quote
-
-from .model import ClothingPriceModel, SearchResult
 from typing import Callable, Iterable, List, Optional, Tuple, Any
 from urllib.parse import quote
 
-# ---- NEW: FastAPI imports ----
+# ---- FastAPI imports ----
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -39,7 +35,7 @@ ModelFactory = Callable[[str, int, float], ClothingPriceModel]
 
 
 def _default_model_factory(base_url: str, limit: int, timeout: float) -> ClothingPriceModel:
-    return ClothingPriceModel(base_url=base_url, limit=limit, timeout=timeout)
+    return ClothingPriceModel(web_search=False, base_url=base_url, limit=limit, timeout=timeout)
 
 
 # =============================================================================
@@ -395,7 +391,6 @@ def _render_template(
   <h1>Clothing Price Lookup Portal</h1>
   <p>Upload a CSV containing <code>brand</code> and <code>title</code> columns to fetch live pricing data.</p>
   {message_html}
-  <form method=\"post\" enctype=\"multipart/form-data\">
   <form method=\"post\" enctype=\"multipart/form-data\" action=\"/upload\">
     <label for=\"base_url\">Product search API URL</label>
     <input id=\"base_url\" name=\"base_url\" type=\"text\" value=\"{_escape(values['base_url'])}\" />
