@@ -8,7 +8,10 @@ import io
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import cgi
+try:
+    import cgi  # legacy http.server form parsing (removed in newer Pythons)
+except ModuleNotFoundError:
+    cgi = None
 from typing import Callable, Iterable, List, Optional, Tuple, Any
 from urllib.parse import quote
 
