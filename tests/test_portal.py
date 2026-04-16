@@ -1,12 +1,12 @@
 import http.client
 import threading
-import asyncio
 from http.server import ThreadingHTTPServer
 
 import pytest
 
 from pricing.model import SearchResult
 from pricing import portal
+from pricing.portal import PortalConfig
 
 
 @pytest.mark.parametrize(
@@ -64,7 +64,7 @@ def _multipart_form(boundary, fields, file_field):
 
 
 def test_portal_serves_results():
-    config = portal.PortalConfig()
+    config = PortalConfig()
     created_models = []
 
     def model_factory(limit, timeout):
@@ -144,6 +144,8 @@ def test_form_does_not_include_base_url_field():
 
 
 def test_search_api_ignores_base_url_payload_key(monkeypatch):
+    import asyncio
+
     created = {}
 
     class _StubModel:
