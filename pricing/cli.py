@@ -5,13 +5,19 @@ import argparse
 import csv
 import json
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 from .model import ClothingPriceModel, SearchResult
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Batch search clothing prices by brand and title")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Batch search clothing prices by brand and title. "
+            "By default the tool searches the open web via DuckDuckGo and extracts "
+            "prices from product pages using schema.org structured data."
+        )
+    )
     parser.add_argument(
         "queries",
         type=Path,
@@ -23,22 +29,55 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default=0.45,
         help="Minimum score threshold required to return a price match. Lower returns more results but with lower confidence.",
     )
-    parser.add_argument(
-        "--base-url",
-        default="https://dummyjson.com/products/search",
-        help="Remote product search endpoint that will be queried for prices.",
+
+    filter_group = parser.add_argument_group(
+        "domain filter (optional)",
+        "Restrict the web search to specific store domains. "
+        "When omitted the search covers the entire open web.",
     )
+    filter_group.add_argument(
+        "--domain",
+        dest="domains",
+        action="append",
+        metavar="DOMAIN",
+        help=(
+            "Restrict results to this store domain (e.g. www.nordstrom.com). "
+            "May be repeated to include multiple stores."
+        ),
+    )
+    filter_group.add_argument(
+        "--domains-file",
+        type=Path,
+        metavar="FILE",
+        help="Path to a text file with one store domain per line.",
+    )
+
+    legacy_group = parser.add_argument_group(
+        "legacy single-endpoint mode",
+        "Query a single JSON product-search API instead of crawling the web. "
+        "Deprecated: prefer the default web-search mode.",
+    )
+    legacy_group.add_argument(
+        "--base-url",
+        default=None,
+        metavar="URL",
+        help=(
+            "[Deprecated] Remote product search endpoint that returns a JSON "
+            "``products`` list. Disables web crawling when supplied."
+        ),
+    )
+
     parser.add_argument(
         "--limit",
         type=int,
         default=10,
-        help="Maximum number of products to request from the search API per query.",
+        help="Maximum number of product pages to fetch per query.",
     )
     parser.add_argument(
         "--timeout",
         type=float,
         default=10.0,
-        help="Timeout (in seconds) for each HTTP request to the product search API.",
+        help="Timeout (in seconds) for each HTTP request.",
     )
     parser.add_argument(
         "--output",
@@ -46,6 +85,22 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         help="Optional path to write JSON results. If omitted results are printed to stdout.",
     )
     return parser.parse_args(argv)
+
+
+def _resolve_domains(args: argparse.Namespace) -> Optional[List[str]]:
+    """Return an explicit domain filter list, or *None* for unrestricted search."""
+    domains: List[str] = args.domains or []
+
+    if args.domains_file is not None:
+        try:
+            for line in args.domains_file.read_text(encoding="utf-8").splitlines():
+                domain = line.strip()
+                if domain and not domain.startswith("#"):
+                    domains.append(domain)
+        except OSError as exc:
+            raise SystemExit(f"Cannot read domains file: {exc}") from exc
+
+    return domains if domains else None
 
 
 def load_queries(path: Path) -> List[Tuple[str, str]]:
@@ -85,11 +140,22 @@ def main(argv: Iterable[str] | None = None) -> int:
     if not queries:
         raise SystemExit("No queries loaded from the provided file")
 
-    model = ClothingPriceModel(
-        base_url=args.base_url,
-        limit=args.limit,
-        timeout=args.timeout,
-    )
+    if args.base_url is not None:
+        # Legacy single-endpoint mode
+        model = ClothingPriceModel(
+            base_url=args.base_url,
+            web_search=False,
+            limit=args.limit,
+            timeout=args.timeout,
+        )
+    else:
+        # Web-search mode (default): optionally filtered to specific domains
+        model = ClothingPriceModel(
+            domains=_resolve_domains(args),
+            web_search=True,
+            limit=args.limit,
+            timeout=args.timeout,
+        )
     try:
         results = model.batch_search(queries, min_score=args.min_score)
     finally:

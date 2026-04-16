@@ -9,8 +9,25 @@ import re
 import unicodedata
 from difflib import SequenceMatcher
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
+
+# Default store domains used when no explicit domain list is provided.
+DEFAULT_DOMAINS: List[str] = [
+    "www.nordstrom.com",
+    "www.zappos.com",
+    "www.macys.com",
+    "www.gap.com",
+    "www.uniqlo.com",
+]
+
+_DDGO_SEARCH_URL = "https://html.duckduckgo.com/html/"
+_MAX_RESULTS_PER_DOMAIN = 3  # maximum product pages inspected per domain per query
+_MAX_WEB_RESULTS = 10        # maximum result pages fetched during open web search
+_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
 
 
 @dataclass(frozen=True)
@@ -41,24 +58,47 @@ class _Product:
 
 
 class ClothingPriceModel:
-    """Fetches clothing prices by querying a remote search endpoint."""
+    """Fetches clothing prices by querying remote product search sources.
+
+    Three search strategies are supported (selected at construction time):
+
+    * **Web search mode** (default, ``web_search=True``, ``domains=None``):
+      An open DuckDuckGo HTML search for ``{brand} {title} price buy`` is
+      performed with no domain restriction.  The top result pages are fetched
+      and prices are extracted from schema.org JSON-LD or ``<meta>`` tags.
+    * **Domain-filtered web search** (``web_search=True``, ``domains=[...]``):
+      Same DuckDuckGo approach but each search includes a ``site:domain``
+      restriction so only pages from the given stores are visited.  Errors
+      from individual domains are silently skipped.
+    * **Base-URL mode** (legacy, ``web_search=False``): A single JSON API
+      endpoint is queried with ``q`` and ``limit`` parameters and must return
+      a ``products`` list containing ``brand``, ``title`` and ``price`` fields.
+
+    In all modes the existing scoring logic is used to select the best match.
+    """
 
     def __init__(
         self,
         *,
         base_url: str = "https://dummyjson.com/products/search",
+        domains: Optional[List[str]] = None,
+        web_search: bool = True,
         limit: int = 10,
         timeout: float = 10.0,
         http_get: Optional[Callable[[str, Dict[str, str], float], Dict[str, object]]] = None,
+        http_get_raw: Optional[Callable[[str, float], str]] = None,
     ) -> None:
         if limit <= 0:
             raise ValueError("limit must be a positive integer")
         if timeout <= 0:
             raise ValueError("timeout must be positive")
         self.base_url = base_url
+        self.domains = domains
+        self.web_search = web_search
         self.limit = limit
         self.timeout = timeout
         self._http_get = http_get or _default_http_get
+        self._http_get_raw = http_get_raw or _default_http_get_raw
 
     def close(self) -> None:
         """Provided for API compatibility; no persistent connections are kept."""
@@ -127,6 +167,11 @@ class ClothingPriceModel:
         )
 
     def _fetch_products(self, brand: str, title: str) -> List[_Product]:
+        if self.web_search:
+            if self.domains is not None:
+                return self._fetch_products_from_domains(brand, title)
+            return self._fetch_products_from_web(brand, title)
+        # Legacy base-URL mode
         query = f"{brand} {title}".strip()
         payload = self._http_get(
             self.base_url,
@@ -149,6 +194,64 @@ class ClothingPriceModel:
                 continue
             normalised_products.append(_Product(brand=brand_value, title=title_value, price=price))
         return normalised_products
+
+    def _fetch_products_from_domains(self, brand: str, title: str) -> List[_Product]:
+        """Collect product candidates by searching each domain via DuckDuckGo."""
+        products: List[_Product] = []
+        query = f"{brand} {title}".strip()
+        for domain in self.domains:  # type: ignore[union-attr]
+            if len(products) >= self.limit:
+                break
+            try:
+                domain_products = self._search_domain(domain, brand, query)
+                products.extend(domain_products)
+            except RemoteLookupError:
+                continue
+        return products[: self.limit]
+
+    def _search_domain(self, domain: str, brand: str, query: str) -> List[_Product]:
+        """Use DuckDuckGo to discover product pages on *domain*, then extract prices."""
+        ddg_query = f"{query} site:{domain}"
+        ddg_html = self._http_get_raw(
+            f"{_DDGO_SEARCH_URL}?{urlencode({'q': ddg_query})}",
+            self.timeout,
+        )
+        urls = _extract_ddg_urls(ddg_html)[:_MAX_RESULTS_PER_DOMAIN]
+        products: List[_Product] = []
+        for url in urls:
+            try:
+                page_html = self._http_get_raw(url, self.timeout)
+                product = _extract_product_from_page(page_html, domain, brand)
+                if product is not None:
+                    products.append(product)
+            except RemoteLookupError:
+                continue
+        return products
+
+    def _fetch_products_from_web(self, brand: str, title: str) -> List[_Product]:
+        """Open-web DuckDuckGo search with no domain restriction."""
+        query = f"{brand} {title} price buy".strip()
+        try:
+            ddg_html = self._http_get_raw(
+                f"{_DDGO_SEARCH_URL}?{urlencode({'q': query})}",
+                self.timeout,
+            )
+        except RemoteLookupError:
+            return []
+        urls = _extract_ddg_urls(ddg_html)[: min(self.limit, _MAX_WEB_RESULTS)]
+        products: List[_Product] = []
+        for url in urls:
+            if len(products) >= self.limit:
+                break
+            try:
+                page_html = self._http_get_raw(url, self.timeout)
+                domain = urlparse(url).netloc or url
+                product = _extract_product_from_page(page_html, domain, brand)
+                if product is not None:
+                    products.append(product)
+            except RemoteLookupError:
+                continue
+        return products
 
 
 def _title_similarity(candidate: str, query: str) -> float:
@@ -178,7 +281,7 @@ def _normalize_text(value: str) -> str:
 def _default_http_get(url: str, params: Dict[str, str], timeout: float) -> Dict[str, object]:
     query = urlencode(params)
     target = f"{url}?{query}" if query else url
-    request = Request(target)
+    request = Request(target, headers={"User-Agent": _USER_AGENT})
     try:
         with urlopen(request, timeout=timeout) as response:
             charset = response.headers.get_content_charset() or "utf-8"
@@ -191,12 +294,150 @@ def _default_http_get(url: str, params: Dict[str, str], timeout: float) -> Dict[
         raise RemoteLookupError("Failed to decode JSON payload") from exc
 
 
+def _default_http_get_raw(url: str, timeout: float) -> str:
+    """Fetch a URL and return the response body as a string."""
+    request = Request(url, headers={"User-Agent": _USER_AGENT})
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            charset = response.headers.get_content_charset() or "utf-8"
+            return response.read().decode(charset, errors="ignore")
+    except (HTTPError, URLError) as exc:
+        raise RemoteLookupError(str(exc)) from exc
+
+
+def _extract_ddg_urls(html_content: str) -> List[str]:
+    """Extract result page URLs from a DuckDuckGo HTML search response."""
+    urls: List[str] = []
+    # DuckDuckGo wraps result links as //duckduckgo.com/l/?uddg=<url-encoded-url>
+    for match in re.finditer(
+        r'href="//duckduckgo\.com/l/\?(?:[^"]*&amp;|[^"]*&)?uddg=([^"&]+)', html_content
+    ):
+        url = unquote(match.group(1))
+        if url.startswith("http"):
+            urls.append(url)
+    if not urls:
+        # Fallback: direct href on result anchors (some DDG layouts)
+        for match in re.finditer(
+            r'class="result__a"[^>]*href="(https?://[^"]+)"', html_content
+        ):
+            urls.append(match.group(1))
+    return urls
+
+
+def _extract_product_from_page(html_content: str, domain: str, brand: str) -> Optional["_Product"]:
+    """Attempt to extract a :class:`_Product` from a product page's HTML.
+
+    Tries schema.org JSON-LD first, then falls back to Open Graph meta tags.
+    Returns ``None`` when no usable product information is found.
+    """
+    # --- JSON-LD ---
+    for match in re.finditer(
+        r"<script[^>]+type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>",
+        html_content,
+        re.DOTALL | re.IGNORECASE,
+    ):
+        try:
+            data = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        product = _parse_jsonld_product(data, domain)
+        if product is not None:
+            return product
+
+    # --- Open Graph / meta tag fallback ---
+    return _extract_product_from_meta(html_content, domain, brand)
+
+
+def _parse_jsonld_product(data: object, domain: str) -> Optional["_Product"]:
+    """Extract a :class:`_Product` from a schema.org JSON-LD object or graph."""
+    items = data if isinstance(data, list) else [data]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        typ = item.get("@type", "")
+        types: List[str] = typ if isinstance(typ, list) else [typ]
+        if "Product" not in types:
+            continue
+
+        name = str(item.get("name", "")).strip()
+        if not name:
+            continue
+
+        brand_field = item.get("brand", {})
+        if isinstance(brand_field, dict):
+            brand_name = str(brand_field.get("name", "")).strip()
+        else:
+            brand_name = str(brand_field).strip()
+
+        price = _extract_price_from_offers(item.get("offers"))
+        if price is None:
+            continue
+
+        return _Product(brand=brand_name or domain, title=name, price=price)
+    return None
+
+
+def _extract_price_from_offers(offers: object) -> Optional[float]:
+    """Return a price float from a schema.org Offer or AggregateOffer structure."""
+    if offers is None:
+        return None
+    if isinstance(offers, list):
+        for offer in offers:
+            price = _extract_price_from_offers(offer)
+            if price is not None:
+                return price
+        return None
+    if not isinstance(offers, dict):
+        return None
+    for field in ("price", "lowPrice"):
+        value = offers.get(field)
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def _extract_product_from_meta(html_content: str, domain: str, brand: str) -> Optional["_Product"]:
+    """Extract product info from Open Graph and similar meta tags."""
+    og_title: Optional[str] = None
+    og_price: Optional[float] = None
+
+    m = re.search(
+        r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)',
+        html_content,
+        re.IGNORECASE,
+    )
+    if m:
+        og_title = m.group(1).strip()
+
+    for pattern in (
+        r'<meta[^>]+property=["\'](?:product|og):price:amount["\'][^>]+content=["\']([^"\']+)',
+        r'<meta[^>]+name=["\']twitter:data1["\'][^>]+content=["\']([^"\']+)',
+    ):
+        m = re.search(pattern, html_content, re.IGNORECASE)
+        if m:
+            try:
+                # Strip common currency symbols before parsing
+                raw = re.sub(r"[^\d.]", "", m.group(1).strip())
+                og_price = float(raw)
+                break
+            except (TypeError, ValueError):
+                pass
+
+    if og_title and og_price is not None:
+        return _Product(brand=brand, title=og_title, price=og_price)
+    return None
+
+
 class RemoteLookupError(RuntimeError):
     """Raised when the remote price lookup fails."""
 
 
 __all__ = [
     "ClothingPriceModel",
+    "DEFAULT_DOMAINS",
     "RemoteLookupError",
     "SearchResult",
 ]
