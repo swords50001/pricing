@@ -136,6 +136,8 @@ class ClothingPriceModel:
             products = self._fetch_products(brand, title)
         except RemoteLookupError:
             return None
+        if not products:
+            return None
 
         best_product: Optional[_Product] = None
         best_score = -math.inf
@@ -240,17 +242,21 @@ class ClothingPriceModel:
             return []
         urls = _extract_ddg_urls(ddg_html)[: min(self.limit, _MAX_WEB_RESULTS)]
         products: List[_Product] = []
+        fetched_pages = 0
         for url in urls:
             if len(products) >= self.limit:
                 break
             try:
                 page_html = self._http_get_raw(url, self.timeout)
+                fetched_pages += 1
                 domain = urlparse(url).netloc or url
                 product = _extract_product_from_page(page_html, domain, brand)
                 if product is not None:
                     products.append(product)
             except RemoteLookupError:
                 continue
+        if fetched_pages == 0:
+            return []
         return products
 
 
@@ -301,7 +307,7 @@ def _default_http_get_raw(url: str, timeout: float) -> str:
         with urlopen(request, timeout=timeout) as response:
             charset = response.headers.get_content_charset() or "utf-8"
             return response.read().decode(charset, errors="ignore")
-    except (HTTPError, URLError) as exc:
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
         raise RemoteLookupError(str(exc)) from exc
 
 
