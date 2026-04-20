@@ -8,8 +8,8 @@ from pricing.model import (
     RemoteLookupError,
     _default_http_get_raw,
     _extract_ddg_urls,
-    _extract_product_from_page,
     _extract_price_from_offers,
+    _extract_product_from_page,
     _parse_jsonld_product,
 )
 
