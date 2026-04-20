@@ -6,10 +6,11 @@ from pricing.model import (
     ClothingPriceModel,
     DEFAULT_DOMAINS,
     RemoteLookupError,
+    _default_http_get_raw,
     _extract_ddg_urls,
+    _extract_price_from_offers,
     _extract_product_from_page,
     _parse_jsonld_product,
-    _extract_price_from_offers,
 )
 
 
@@ -122,6 +123,11 @@ _PRODUCT_PAGE_JSONLD = """\
 def _build_ddg_html(url: str) -> str:
     from urllib.parse import quote
     return _DDG_HTML_TEMPLATE.format(encoded_url=quote(url, safe=""))
+
+
+def _build_ddg_html_for_urls(urls):
+    from urllib.parse import quote
+    return "".join(f'<a href="//duckduckgo.com/l/?uddg={quote(url, safe="")}">x</a>' for url in urls)
 
 
 def _build_product_page(brand: str, title: str, price: str) -> str:
@@ -385,6 +391,44 @@ def test_web_search_skips_pages_with_no_price():
     assert results == [None]
 
 
+def test_default_http_get_raw_wraps_timeout_errors(monkeypatch):
+    response = MagicMock()
+    response.headers.get_content_charset.return_value = "utf-8"
+    response.read.side_effect = TimeoutError("The read operation timed out")
+
+    urlopen_mock = MagicMock()
+    urlopen_mock.return_value.__enter__.return_value = response
+    monkeypatch.setattr("pricing.model.urlopen", urlopen_mock)
+
+    with pytest.raises(RemoteLookupError) as exc_info:
+        _default_http_get_raw("https://example.com", 1.0)
+    assert isinstance(exc_info.value.__cause__, TimeoutError)
+
+
+def test_fetch_products_from_web_returns_empty_when_all_page_fetches_fail():
+    urls = ["https://example.com/p/1", "https://example.com/p/2"]
+    ddg_html = _build_ddg_html_for_urls(urls)
+    http_get_raw = MagicMock(
+        side_effect=[ddg_html, RemoteLookupError("timeout"), RemoteLookupError("timeout")]
+    )
+    model = ClothingPriceModel(http_get_raw=http_get_raw, limit=5)
+
+    products = model._fetch_products_from_web("Nike", "Pegasus 40")
+    assert products == []
+
+
+def test_batch_search_returns_none_when_all_page_fetches_fail():
+    urls = ["https://example.com/p/1", "https://example.com/p/2"]
+    ddg_html = _build_ddg_html_for_urls(urls)
+    http_get_raw = MagicMock(
+        side_effect=[ddg_html, RemoteLookupError("timeout"), RemoteLookupError("timeout")]
+    )
+    model = ClothingPriceModel(http_get_raw=http_get_raw, limit=5)
+
+    results = model.batch_search([("Nike", "Pegasus 40")])
+    assert results == [None]
+
+
 def test_web_search_respects_limit():
     """No more than limit pages should be fetched."""
     from urllib.parse import quote
@@ -407,4 +451,3 @@ def test_web_search_respects_limit():
 
     # Should stop after 2 successful extractions
     assert len(products) <= 2
-
