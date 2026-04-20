@@ -125,6 +125,11 @@ def _build_ddg_html(url: str) -> str:
     return _DDG_HTML_TEMPLATE.format(encoded_url=quote(url, safe=""))
 
 
+def _build_ddg_html_for_urls(urls):
+    from urllib.parse import quote
+    return "".join(f'<a href="//duckduckgo.com/l/?uddg={quote(url, safe="")}">x</a>' for url in urls)
+
+
 def _build_product_page(brand: str, title: str, price: str) -> str:
     return _PRODUCT_PAGE_JSONLD.format(brand=brand, title=title, price=price)
 
@@ -400,13 +405,9 @@ def test_default_http_get_raw_wraps_timeout_errors(monkeypatch):
     assert isinstance(exc_info.value.__cause__, TimeoutError)
 
 
-def test_web_search_returns_empty_products_when_all_page_fetches_fail():
-    from urllib.parse import quote
-
+def test_fetch_products_from_web_returns_empty_when_all_page_fetches_fail():
     urls = ["https://example.com/p/1", "https://example.com/p/2"]
-    ddg_html = "".join(
-        f'<a href="//duckduckgo.com/l/?uddg={quote(url, safe="")}">x</a>' for url in urls
-    )
+    ddg_html = _build_ddg_html_for_urls(urls)
     http_get_raw = MagicMock(
         side_effect=[ddg_html, RemoteLookupError("timeout"), RemoteLookupError("timeout")]
     )
@@ -416,13 +417,9 @@ def test_web_search_returns_empty_products_when_all_page_fetches_fail():
     assert products == []
 
 
-def test_web_search_returns_none_when_all_page_fetches_fail():
-    from urllib.parse import quote
-
+def test_batch_search_returns_none_when_all_page_fetches_fail():
     urls = ["https://example.com/p/1", "https://example.com/p/2"]
-    ddg_html = "".join(
-        f'<a href="//duckduckgo.com/l/?uddg={quote(url, safe="")}">x</a>' for url in urls
-    )
+    ddg_html = _build_ddg_html_for_urls(urls)
     http_get_raw = MagicMock(
         side_effect=[ddg_html, RemoteLookupError("timeout"), RemoteLookupError("timeout")]
     )
